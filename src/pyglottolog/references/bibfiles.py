@@ -6,44 +6,67 @@ import re
 import collections
 import unicodedata
 import datetime
+import math
+import functools
 
 from six import string_types
 
 import attr
 
-from clldutils.misc import UnicodeMixin
+from clldutils.misc import UnicodeMixin, lazyproperty
 from clldutils.path import memorymapped, Path
 from clldutils.source import Source
 from clldutils.text import split_text
 from clldutils.inifile import INI
 
 from . import bibtex
+from . import util
 from .bibfiles_db import Database
 
 __all__ = ['BibFiles', 'BibFile', 'Entry']
 
 BIBFILES = 'bibfiles.sqlite3'
+DOCTYPES = collections.OrderedDict((k, k) for k in [
+    'grammar',
+    'grammar_sketch',
+    'dictionary',
+    'specific_feature',
+    'phonology',
+    'text',
+    'new_testament',
+    'wordlist',
+    'comparative',
+    'minimal',
+    'socling',
+    'dialectology',
+    'overview',
+    'ethnographic',
+    'bibliographical',
+    'unknown',
+])
+PREF_YEAR_PATTERN = re.compile('\[(?P<year>(1|2)[0-9]{3})(\-[0-9]+)?\]')
+YEAR_PATTERN = re.compile('(?P<year>(1|2)[0-9]{3})')
 
 
 class BibFiles(list):
     """Ordered collection of `BibFile` objects accessible by filname or index."""
 
     @classmethod
-    def from_path(cls, path):
+    def from_path(cls, path, api=None):
         """BibTeX files from `<path>/bibtex/*.bib` if listed in `<path>/BIBFILES.ini`."""
         if not isinstance(path, Path):
             path = Path(path)
         ini = INI.from_file(path / 'BIBFILES.ini', interpolation=None)
-        return cls(cls._iterbibfiles(ini, path / 'bibtex'))
+        return cls(cls._iterbibfiles(ini, path / 'bibtex', api=api))
 
     @staticmethod
-    def _iterbibfiles(ini, bibtex_path):
+    def _iterbibfiles(ini, bibtex_path, api=None):
         for sec in ini.sections():
             if sec.endswith('.bib'):
                 fpath = bibtex_path / sec
                 if not fpath.exists():  # pragma: no cover
                     raise ValueError('invalid bibtex file referenced in BIBFILES.ini')
-                yield BibFile(fname=fpath, **ini[sec])
+                yield BibFile(fname=fpath, api=api, **ini[sec])
 
     def __init__(self, bibfiles):
         super(BibFiles, self).__init__(bibfiles)
@@ -55,9 +78,9 @@ class BibFiles(list):
             return self._map[index_or_filename]
         return super(BibFiles, self).__getitem__(index_or_filename)
 
-    def to_sqlite(self, filepath=BIBFILES, rebuild=False):
+    def to_sqlite(self, filepath=BIBFILES, rebuild=False, verbose=False):
         """Return a database with the bibfiles loaded."""
-        return Database.from_bibfiles(self, filepath, rebuild=rebuild)
+        return Database.from_bibfiles(self, filepath, rebuild=rebuild, verbose=verbose)
 
     def roundtrip_all(self):
         """Load and save all bibfiles with the current settings."""
@@ -84,6 +107,7 @@ class BibFile(UnicodeMixin):
         converter=lambda s: None if s is None or s.lower() == 'none' else s)
     priority = attr.ib(default=0, converter=int)
     url = attr.ib(default=None)
+    api = attr.ib(default=None)
 
     @property
     def id(self):
@@ -103,7 +127,7 @@ class BibFile(UnicodeMixin):
                     text = string[m.start():]
         if text:
             for k, (t, f) in bibtex.iterentries_from_text(text, encoding=self.encoding):
-                return Entry(k, t, f, self)
+                return Entry(k, t, f, self, self.api)
         raise KeyError(item)
 
     def visit(self, visitor=None):
@@ -123,7 +147,7 @@ class BibFile(UnicodeMixin):
 
     def iterentries(self):
         for k, (t, f) in bibtex.iterentries(filename=self.fname, encoding=self.encoding):
-            yield Entry(k, t, f, self)
+            yield Entry(k, t, f, self, self.api)
 
     def keys(self):
         return ['{0}:{1}'.format(self.id, e.key) for e in self.iterentries()]
@@ -144,7 +168,7 @@ class BibFile(UnicodeMixin):
                 new += 1
             entries[key] = (type_, fields)
         self.save(entries)
-        if log:
+        if log:  # pragma: no cover
             log.info('{0} new entries'.format(new))
 
     def load(self, preserve_order=None):
@@ -189,13 +213,15 @@ class BibFile(UnicodeMixin):
         print(table)
 
 
-@attr.s
+@functools.total_ordering
+@attr.s(cmp=False)
 class Entry(UnicodeMixin):
 
     key = attr.ib()
     type = attr.ib()
     fields = attr.ib()
     bib = attr.ib()
+    api = attr.ib(default=None)
 
     # FIXME: add method to apply triggers!
 
@@ -203,6 +229,88 @@ class Entry(UnicodeMixin):
     lgcode_in_brackets_pattern = re.compile("\[(" + lgcode_regex + ")\]")
     recomma = re.compile("[,/]\s?")
     lgcode_pattern = re.compile(lgcode_regex + "$")
+
+    def __eq__(self, other):
+        return self.weight == other.weight
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __lt__(self, other):
+        return self.weight < other.weight
+
+    @property
+    def _defined_doctypes(self):
+        return collections.OrderedDict((hht.id, hht.id) for hht in self.api.hhtypes) \
+            if self.api else DOCTYPES
+
+    @lazyproperty
+    def weight(self):
+        doctypes = self._defined_doctypes
+        index = len(doctypes)
+        doctype = None
+
+        for _doctype in self.doctypes(doctypes)[0]:
+            index = list(doctypes.values()).index(_doctype)
+            doctype = getattr(_doctype, 'id', _doctype)
+            break
+
+        # the number of pages is divided by number of doctypes times number of described languages
+        pages = int(math.ceil(
+            float(self.pages_int or 0) /
+            ((len(self.doctypes(doctypes)[0]) or 1) *
+             (len(self.lgcodes(self.fields.get('lgcode', ''))) or 1))))
+
+        if doctype == 'grammar' and pages >= 300:
+            index = -1
+
+        return -index, pages, self.year_int or 0, self.id
+
+    @lazyproperty
+    def med_type(self):
+        if self.api:
+            doctypes = list(self._defined_doctypes.keys())
+            index = -self.weight[0]
+            if index == -1:
+                return self.api.med_types.long_grammar
+            if 'dictionary' in doctypes and index < doctypes.index('dictionary'):
+                return self.api.med_types.get(doctypes[index])
+            if 'wordlist' in doctypes and index < doctypes.index('wordlist'):
+                return self.api.med_types.phonology_or_text
+            return self.api.med_types.wordlist_or_less
+
+    @lazyproperty
+    def year_int(self):
+        if self.fields.get('year'):
+            # prefer years in brackets over the first 4-digit number.
+            match = PREF_YEAR_PATTERN.search(self.fields.get('year'))
+            if match:
+                return int(match.group('year'))
+            match = YEAR_PATTERN.search(self.fields.get('year'))
+            if match:
+                return int(match.group('year'))
+
+    @lazyproperty
+    def pages_int(self):
+        if self.fields.get('numberofpages'):
+            try:
+                pages = int(self.fields.get('numberofpages').strip())
+                if pages < util.MAX_PAGE:
+                    return pages
+            except ValueError:
+                pass
+
+        if self.fields.get('pages'):
+            return util.compute_pages(self.fields['pages'])[2]
+
+    @lazyproperty
+    def publisher_and_address(self):
+        p = self.fields.get('publisher')
+        if p and ':' in p:
+            address, publisher = [s.strip() for s in p.split(':', 1)]
+            if (not self.fields.get('address')) or self.fields['address'] == address:
+                return publisher, address
+        return p, self.fields.get('address')
 
     def __unicode__(self):
         """
@@ -253,10 +361,17 @@ class Entry(UnicodeMixin):
         return res, self.parse_ca(self.fields.get('lgcode'))
 
     def doctypes(self, hhtypes):
-        res = []
+        """
+        Ordered doctypes assigned to this entry.
+
+        :param hhtypes: `OrderedDict` mapping doctype names to doctypes
+        :return: `list` of values of `hhtypes` which apply to the entry, ordered by occurrence in\
+        `hhtypes`.
+        """
+        res = set()
         if 'hhtype' in self.fields:
             for ss in split_text(self.fields['hhtype'], separators=',;'):
                 ss = ss.split('(')[0].strip()
                 if ss in hhtypes:
-                    res.append(hhtypes[ss])
-        return res, self.parse_ca(self.fields.get('hhtype'))
+                    res.add(ss)
+        return [v for k, v in hhtypes.items() if k in res], self.parse_ca(self.fields.get('hhtype'))

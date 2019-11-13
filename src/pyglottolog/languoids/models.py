@@ -2,28 +2,69 @@
 
 from __future__ import unicode_literals, print_function, division
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import re
 
-from six import text_type
+from six import text_type, string_types
 import attr
 import markdown
 import pycountry
-from clldutils.misc import slug, UnicodeMixin
+from clldutils.misc import slug, UnicodeMixin, nfilter
 from clldutils import jsonlib
-from clldutils.declenum import DeclEnum
+from dateutil import parser
+import purl
 
 from ..util import message
+from ..config import AESSource, AES
 
 __all__ = [
     'Glottocode', 'Glottocodes',
     'Reference',
-    'Level', 'Country', 'Macroarea',
+    'Country',
     'ClassificationComment',
     'ISORetirement',
-    'EndangermentStatus',
+    'Endangerment',
     'EthnologueComment',
+    'Link',
 ]
+
+
+@attr.s(hash=True)
+class Link(object):
+    url = attr.ib()
+    label = attr.ib(default=None)
+
+    @property
+    def domain(self):
+        return purl.URL(self.url).domain()
+
+    @classmethod
+    def from_string(cls, s):
+        s = s.strip()
+        if s.startswith('['):
+            assert s.endswith(')') and '](' in s
+            return cls(*reversed(s[1:-1].split('](')))
+        return cls(s)
+
+    @classmethod
+    def from_(cls, obj):
+        if isinstance(obj, cls):
+            return obj
+        if isinstance(obj, string_types):
+            return cls.from_string(obj)
+        if isinstance(obj, (list, tuple)) and len(obj) == 2:
+            return cls(*obj)
+        if isinstance(obj, dict):
+            return cls(**obj)
+        raise TypeError()
+
+    def to_string(self):
+        if self.label:
+            return '[{0}]({1})'.format(self.label, self.url)
+        return self.url
+
+    def __json__(self):
+        return attr.asdict(self)
 
 
 class Glottocodes(object):
@@ -127,26 +168,6 @@ class Reference(UnicodeMixin):
         return res
 
 
-class Level(DeclEnum):
-    """
-    Glottolog distinguishes three levels of languoids:
-    - family: any sub-grouping of languoids above the language level
-    - language: defined as per\
-    http://glottolog.org/glottolog/glottologinformation#inclusionexclusionoflanguages
-    - dialect: any variety which is not a language
-
-    The Glottolog classification imposes the following rules on the nesting of languoids:
-    1. Dialects must not be top-level nodes of the classification.
-    2. Dialects must not have a family as parent.
-    3. Languages must either be isolates (i.e. top-level nodes) or have a family as
-       parent.
-    4. The levels of the languoids in a tree branch must be monotonically descending.
-    """
-    family = 1, 'sub-grouping of languoids above the language level'
-    language = 2, 'defined by mutual non-intellegibility'
-    dialect = 3, 'any variety which is not a language'
-
-
 @attr.s
 class Country(UnicodeMixin):
     """
@@ -163,21 +184,15 @@ class Country(UnicodeMixin):
 
     @classmethod
     def from_name(cls, name):
-        try:
-            res = pycountry.countries.get(name=name)
-            if res:
-                return cls(id=res.alpha_2, name=res.name)
-        except KeyError:
-            pass
+        res = pycountry.countries.get(name=name)
+        if res:
+            return cls(id=res.alpha_2, name=res.name)
 
     @classmethod
     def from_id(cls, id_):
-        try:
-            res = pycountry.countries.get(alpha_2=id_)
-            if res:
-                return cls(id=res.alpha_2, name=res.name)
-        except KeyError:
-            pass
+        res = pycountry.countries.get(alpha_2=id_)
+        if res:
+            return cls(id=res.alpha_2, name=res.name)
 
     @classmethod
     def from_text(cls, text):
@@ -187,32 +202,6 @@ class Country(UnicodeMixin):
         return cls.from_name(text)
 
 
-class Macroarea(DeclEnum):
-    """
-    Glottolog languoids can be related to a macroarea.
-    """
-    northamerica =\
-        'North America',\
-        'North and Middle America up to Panama. Includes Greenland.'
-    southamerica =\
-        'South America',\
-        'Everything South of Darién'
-    africa =\
-        'Africa',\
-        'The continent'
-    australia =\
-        'Australia',\
-        'The continent'
-    eurasia =\
-        'Eurasia',\
-        'The Eurasian landmass North of Sinai. Includes Japan and islands to the North' \
-        'of it. Does not include Insular South East Asia.'
-    pacific =\
-        'Papunesia',\
-        'All islands between Sumatra and the Americas, excluding islands off Australia' \
-        'and excluding Japan and islands to the North of it.'
-
-
 @attr.s
 class ClassificationComment(object):
     sub = attr.ib(default=None)
@@ -220,7 +209,24 @@ class ClassificationComment(object):
     family = attr.ib(default=None)
     familyrefs = attr.ib(default=attr.Factory(list), converter=Reference.from_list)
 
+    def merged_refs(self, type):
+        assert type in ['sub', 'family']
+        res = defaultdict(set)
+        for m in Reference.pattern.finditer(getattr(self, type) or ''):
+            res[m.group('key')].add(m.group('pages'))
+        for ref in getattr(self, type + 'refs'):
+            res[ref.key].add(ref.pages)
+        return [
+            Reference(key=key, pages=';'.join(sorted(nfilter(pages))) or None)
+            for key, pages in res.items()]
+
     def check(self, lang, keys, log):
+        for attrib in ['subrefs', 'familyrefs']:
+            for ref in getattr(self, attrib):
+                if ref.key not in keys:
+                    log.error(message(
+                        lang, 'classification {0}: invalid bibkey: {1}'.format(attrib, ref.key)))
+
         for attrib in ['sub', 'family']:
             comment = getattr(self, attrib)
             if comment:
@@ -248,23 +254,20 @@ class ISORetirement(object):
     def asdict(self):
         return attr.asdict(self)
 
+    __json__ = asdict
 
-class EndangermentStatus(DeclEnum):
-    safe = 1, 'not endangered', '<= 6a (Vigorous)'
-    vulnerable = 2, 'threatened', '6b'
-    definite = 3, 'shifting', '7'
-    severe = 4, 'moribund', '8a'
-    critical = 5, 'nearly extinct', '8b'
-    extinct = 6, 'extinct', '10'
 
-    @classmethod
-    def get(cls, item):
-        if item in list(cls):
-            return item
-        for li in cls:
-            if li.name == item or li.value == item or li.description == item:
-                return li
-        raise ValueError(item)
+@attr.s
+class Endangerment(object):
+    status = attr.ib(validator=attr.validators.instance_of(AES))
+    source = attr.ib(validator=attr.validators.instance_of(AESSource))
+    comment = attr.ib()
+    date = attr.ib(converter=parser.parse)
+
+    def __json__(self):
+        res = attr.asdict(self, recurse=True)
+        res['date'] = res['date'].isoformat().split('T')[0]
+        return res
 
 
 def valid_ethnologue_versions(inst, attr, value):
@@ -306,6 +309,9 @@ class EthnologueComment(UnicodeMixin):
         validator=valid_ethnologue_versions,
         converter=lambda s: s.replace('693', '639').split('/'))
     comment = attr.ib(default=None, validator=valid_comment)
+
+    def __json__(self):
+        return attr.asdict(self)
 
     def check(self, lang, keys, log):
         try:

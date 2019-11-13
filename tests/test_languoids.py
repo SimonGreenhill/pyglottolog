@@ -2,17 +2,24 @@ from __future__ import unicode_literals
 
 import pytest
 
-from pyglottolog.languoids import (Languoid, EndangermentStatus,
-    Glottocodes, Glottocode, Level, Country, Reference, Macroarea,
-    ClassificationComment, EthnologueComment)
+from pyglottolog.languoids import (Languoid,
+    Glottocodes, Glottocode, Country, Reference,
+    ClassificationComment, EthnologueComment, Link)
 
 
 def test_legacy_imports():
     from pyglottolog import objects
     assert objects.Glottocode is Glottocode
-    assert objects.Macroarea is Macroarea
-    assert objects.Level is Level
     assert objects.Reference is Reference
+
+
+def test_Link():
+    assert Link.from_(dict(url='xyz')).label is None
+    assert Link.from_('[label](url)').url == 'url'
+    assert 'url' in Link.from_('[label](url)').__json__()
+
+    with pytest.raises(TypeError):
+        Link.from_(5)
 
 
 def test_Glottocodes(tmpdir):
@@ -28,18 +35,6 @@ def test_Glottocodes(tmpdir):
     # make sure it's also written to file:
     assert gc in Glottocodes(str(json))
     assert len(list(Glottocodes(str(json)))) == 1
-
-
-def test_es():
-    assert EndangermentStatus.get('nearly extinct') == EndangermentStatus.critical
-
-
-def test_EndangermentStatus():
-    c = EndangermentStatus.critical
-    assert EndangermentStatus.get(c) == c
-
-    with pytest.raises(ValueError):
-        EndangermentStatus.get(123)
 
 
 @pytest.mark.parametrize('input_, valid', [
@@ -89,6 +84,10 @@ def test_ClassificationComment(mocker):
     log = mocker.Mock()
     cc.check(mocker.Mock(), ['bib:key'], log)
     assert not log.error.called
+    cc = ClassificationComment(sub='A comment about **bib:key**:10-12', subrefs=['**bib:key**:20'])
+    refs = cc.merged_refs('sub')
+    assert len(refs) == 1
+    assert refs[0].pages == '10-12;20'
 
 
 def test_EthnologueComment(mocker):
@@ -115,11 +114,44 @@ def test_EthnologueComment(mocker):
     assert log.error.called
 
 
+def test_ancestors(api):
+    lang = api.languoid('dial1234')
+    assert 'isol1234' in ','.join(repr(a) for a in lang.ancestors)
+
+
+def test_endangerment(api):
+    lang = api.languoid('abcd1235')
+    assert lang.endangerment.status == api.aes_status.vulnerable
+    assert 'source' in lang.endangerment.__json__()
+
+
 def test_Level(api):
-    assert Level.dialect > Level.language
-    assert Level.language == api.languoid('abcd1235').level
+    assert api.languoid_levels.dialect > api.languoid_levels.language
+    assert api.languoid_levels.language == api.languoid('abcd1235').level
     with pytest.raises(ValueError):
-        Level.get('abcde')
+        api.languoid_levels.get('abcde')
+
+
+def test_Category(api):
+    assert api.languoid('book1243').category == api.language_types.bookkeeping.category
+    assert api.languoid('abcd1235').category == api.language_types.spoken_l1.category
+    assert api.languoid('dial1234').category == 'Dialect'
+
+
+def test_sources(api):
+    assert api.languoid('book1242').sources == []
+    with pytest.raises(AssertionError):
+        api.languoid('book1242').sources = [1]
+    api.languoid('book1242').sources = [Reference('key')]
+
+
+def test_ethnologue_comment(api):
+    assert api.languoid('book1243').ethnologue_comment.comment_type == 'missing'
+    assert api.languoid('book1243').ethnologue_comment.__json__()
+
+
+def test_classification_comment(api):
+    assert api.languoid('abcd1234').classification_comment
 
 
 def test_Languoid_sorting(api):
@@ -127,16 +159,22 @@ def test_Languoid_sorting(api):
     assert api.languoid('abcd1236') >= api.languoid('abcd1235')
 
 
-def test_factory(tmpdir, api_copy):
-    f = Languoid.from_dir(api_copy.tree / 'abcd1234')
-    assert f.category == 'Family'
+def test_factory_without_api(api_copy):
+    f = Languoid.from_dir(api_copy.tree / 'abcd1234', _api=api_copy)
     l = Languoid.from_dir(api_copy.tree / f.id / 'abcd1235')
+    assert len(l.macroareas) == 0  # No API passed at initialization => no macroareas!
+
+
+def test_factory(tmpdir, api_copy):
+    f = Languoid.from_dir(api_copy.tree / 'abcd1234', _api=api_copy)
+    assert f.category == 'Family'
+    l = Languoid.from_dir(api_copy.tree / f.id / 'abcd1235', _api=api_copy)
     assert l.name == 'language'
     assert 'abcd1235' in repr(l)
     assert 'language' in '%s' % l
-    assert l.level == Level.language
+    assert l.level == api_copy.languoid_levels.language
     assert l.latitude == pytest.approx(0.5)
-    assert l.longitude == pytest.approx(0.5)
+    assert l.longitude == pytest.approx(-30)
     l.latitude, l.longitude = 1.0, 1.0
     assert l.latitude == pytest.approx(1.0)
     assert l.longitude == pytest.approx(1.0)
@@ -149,8 +187,8 @@ def test_factory(tmpdir, api_copy):
     assert l.id == 'abcd1235'
 
     assert len(l.macroareas) == 2
-    l.macroareas = [Macroarea.africa]
-    assert l.macroareas == [Macroarea.africa]
+    l.macroareas = [api_copy.macroareas.pacific]
+    assert l.macroareas == [api_copy.macroareas.get('Papunesia')]
 
     l.countries = api_copy.countries[:2]
     assert len(l.countries) == 2
@@ -162,8 +200,6 @@ def test_factory(tmpdir, api_copy):
     assert (tmpdir / 'abcd1235').exists()
     assert isinstance(api_copy.languoid('abcd1235').iso_retirement.asdict(), dict)
     assert l.classification_comment is None
-    l.endangerment = 'nearly extinct'
-    assert l.endangerment == EndangermentStatus.critical
     assert l.names == {}
     l.cfg['altnames'] = {'glottolog': 'xyz'}
     assert 'glottolog' in l.names
@@ -180,8 +216,7 @@ def test_isolate(api):
 
 
 def test_attrs(api):
-    l = Languoid.from_name_id_level(
-        api.tree, 'name', 'abcd1235', Level.language, hid='NOCODE')
+    l = Languoid.from_name_id_level(api.tree, 'name', 'abcd1235', 'language', hid='NOCODE')
     l.name = 'other'
     assert l.name == 'other'
     with pytest.raises(AttributeError):

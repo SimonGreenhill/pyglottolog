@@ -1,74 +1,84 @@
 # coding: utf8
 from __future__ import unicode_literals, print_function, division
 import re
-from collections import OrderedDict
+import functools
+import collections
 
 import requests
-from bs4 import BeautifulSoup
+import attr
 
+from csvw.dsv import reader
 from clldutils.misc import nfilter
-from clldutils import jsonlib
+from clldutils.attrlib import valid_range
 
-BASE_URL = "http://www.endangeredlanguages.com"
-STORE = 'endangeredlanguages.json'
+from .util import LinkProvider
 
-
-def read_store(fname):  # pragma: no cover
-    return jsonlib.load(fname) if fname.exists() else {}
+BASE_URL = "http://endangeredlanguages.com"
+CSV_URL = BASE_URL + "/userquery/download/"
 
 
-def store(details_, fname):  # pragma: no cover
-    db = read_store(fname)
-    if not details_:
-        return db
-    db[details_['id']] = details_
-    ordered = OrderedDict()
-    for k in sorted(list(db.keys()), key=lambda lid: int(lid)):
-        v = OrderedDict()
-        for key in sorted(list(db[k].keys())):
-            if key != 'id':
-                v[key] = db[k][key]
-        ordered[k] = v
-    jsonlib.dump(ordered, fname, indent=4)
-    return db
+def split(s, sep=';'):
+    return nfilter(ss.strip() for ss in s.split(sep))
 
 
-def get_soup(path):  # pragma: no cover
-    print('... fetch {0}'.format(path))
-    return BeautifulSoup(requests.get(BASE_URL + path).content, 'html.parser')
+def parse_coords(s):
+    cc = nfilter(ss.strip().replace(' ', '') for ss in re.split('[,;]', s))
+    return [Coordinate(cc[i], cc[i + 1]) for i in range(0, len(cc), 2)]
 
 
-def details(path):  # pragma: no cover
-    soup = get_soup(path)
-    if not soup.find('h2'):
-        return
-    res = dict(id=path.split('/')[-1], name=soup.find('h2').get_text())
-    data = OrderedDict()
-    for tr in soup.find_all('tr'):
-        tds = list(tr.find_all('td'))
-        if len(tds) == 3:
-            data[tds[0].get_text().strip()] = tds[2].get_text().strip()
-
-    names = data.get('ALSO KNOWN AS')
-    if names:
-        res['alternative_names'] = nfilter([n.strip() for n in names.split(',')])
-    if data.get('CODE AUTHORITY') == 'ISO 639-3':
-        res['iso-639-3'] = data.get('LANGUAGE CODE')
-    return res
+@attr.s
+class Coordinate(object):
+    latitude = attr.ib(converter=lambda s: float(s.strip()), validator=valid_range(-90, 90))
+    longitude = attr.ib(converter=lambda s: float(s.strip()), validator=valid_range(-180, 180))
 
 
-def scrape(api, update=False):  # pragma: no cover
-    store_path = api.repos.joinpath('links', STORE)
-    db = read_store(store_path)
-    lang_url = re.compile('/lang/(?P<id>[0-9]+)$')
-    done = set()
-    for a in get_soup('/lang/region').find_all('a', href=True):
-        if a['href'].startswith('/lang/country/') and (a['href'] not in done):
-            for _a in get_soup(a['href']).find_all('a', href=True):
-                match = lang_url.match(_a['href'])
-                if match:
-                    lid = match.group('id')
-                    if lid not in db or update:
-                        db = store(details(_a['href']), store_path)
-            done.add(a['href'])
-            print(len(done))
+@attr.s
+class ElCatLanguage(object):
+    id = attr.ib(converter=int)
+    isos = attr.ib(converter=functools.partial(split, sep=','))
+    name = attr.ib()
+    also_known_as = attr.ib(converter=split)
+    status = attr.ib()
+    speakers = attr.ib()
+    classification = attr.ib()
+    variants_and_dialects = attr.ib(converter=split)
+    u = attr.ib()
+    comment = attr.ib()
+    countries = attr.ib(converter=split)
+    continent = attr.ib()
+    coordinates = attr.ib(converter=parse_coords)
+
+    @property
+    def url(self):
+        return BASE_URL + '/lang/{0.id}'.format(self)
+
+
+def read():
+    return [ElCatLanguage(*row) for row in reader(requests.get(CSV_URL).text.split('\n')) if row]
+
+
+class ElCat(LinkProvider):
+    def iterupdated(self, languoids):
+        elcat_langs = collections.defaultdict(list)
+        for l in read():
+            for iso in l.isos:
+                elcat_langs[iso].append(l)
+
+        for l in languoids:
+            changed = False
+            if l.iso in elcat_langs:
+                if l.update_links(
+                    'endangeredlanguages.com', [(l_.url, l_.name) for l_ in elcat_langs[l.iso]]
+                ):
+                    changed = True
+                if len(elcat_langs[l.iso]) == 1:
+                    # Only add alternative names, if only one ElCat language matches!
+                    changed = l.update_names(
+                        [elcat_langs[l.iso][0].name] + elcat_langs[l.iso][0].also_known_as,
+                        type_='elcat') or changed
+            else:
+                changed = any([l.update_links('endangeredlanguages.com', []),
+                               l.update_names([], type_='elcat')])
+
+            if changed:
+                yield l

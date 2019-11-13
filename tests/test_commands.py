@@ -6,12 +6,36 @@ import pytest
 import mock
 
 from clldutils.path import copytree
+from clldutils.clilib import ParserError
 
 from pyglottolog.__main__ import commands
 
 
 def _args(api_copy, *args):
     return mock.Mock(repos=api_copy, args=list(args), log=mock.Mock())
+
+
+def test_no_repos(api):
+    with pytest.raises(ParserError):
+        commands.show(mock.Mock(repos=None, args=['abcd1235'], log=mock.Mock()))
+
+
+def test_release(api_copy, mocker):
+    mocker.patch('pyglottolog.commands.input', mocker.Mock(return_value='x.y'))
+    with pytest.raises(ValueError):
+        commands.release(_args(api_copy))
+    mocker.patch('pyglottolog.commands.input', mocker.Mock(return_value='2.7'))
+    commands.release(_args(api_copy))
+
+
+def test_update_links(api_copy, capsys, elcat):
+    commands.update_links(_args(api_copy, 'none'))
+    out, _ = capsys.readouterr()
+    assert '0 languoids updated' in out
+
+    commands.update_links(_args(api_copy, 'elcat'))
+    out, _ = capsys.readouterr()
+    assert '1 languoids updated' in out
 
 
 def test_show(capsys, api):
@@ -75,7 +99,7 @@ def test_lff(capsys, api_copy, encoding='utf-8'):
 
 def test_index(api_copy):
     commands.index(_args(api_copy))
-    assert len(list(api_copy.repos.joinpath('languoids').glob('*.md'))) == 8
+    assert len(list(api_copy.repos.joinpath('languoids').glob('*.md'))) == 10
 
 
 def test_tree(capsys, api):
@@ -104,6 +128,9 @@ def test_newick(capsys, api):
     commands.newick(_args(api, 'abcd1235'))
     assert 'language' in capsys.readouterr()[0]
 
+    with pytest.raises(ParserError):
+        commands.newick(_args(api, 'abcd123'))
+
 
 def test_htmlmap(api, capsys, tmpdir):
     commands.htmlmap(_args(api, str(tmpdir)), min_langs_for_legend_item=1)
@@ -124,6 +151,17 @@ def test_bibfiles_db(api_copy):
     commands.bibfiles_db(_args(api_copy))
 
 
+def test_update_sources(api_copy, capsys):
+    commands.update_sources(_args(api_copy))
+    out, _ = capsys.readouterr()
+    assert '1 languoids updated' in out
+
+
+def test_cldf(api_copy, tmpdir):
+    commands._cldf(_args(api_copy, str(tmpdir.join('cldf'))))
+    commands._cldf(_args(api_copy, str(tmpdir.join('cldf'))))
+
+
 def test_check(capsys, api_copy):
     commands.check(_args(api_copy, 'refs'))
 
@@ -131,8 +169,9 @@ def test_check(capsys, api_copy):
     commands.check(args)
     assert 'family' in capsys.readouterr()[0]
     msgs = [a[0] for a, _ in args.log.error.call_args_list]
-    assert all('unregistered glottocode' in m for m in msgs)
-    assert len(msgs) == 5
+    assert any('unregistered glottocode' in m for m in msgs)
+    assert any('missing reference' in m for m in msgs)
+    assert len(msgs) == 27
 
     copytree(
         api_copy.tree / 'abcd1234' / 'abcd1235',
@@ -142,7 +181,7 @@ def test_check(capsys, api_copy):
     commands.check(args)
     msgs = [a[0] for a, _ in args.log.error.call_args_list]
     assert any('duplicate glottocode' in m for m in msgs)
-    assert len(msgs) == 7
+    assert len(msgs) == 29
 
     (api_copy.tree / 'abcd1235').rename(api_copy.tree / 'abcd1237')
     args = _args(api_copy)
@@ -150,6 +189,13 @@ def test_check(capsys, api_copy):
     msgs = [a[0] for a, _ in args.log.error.call_args_list]
     assert any('duplicate hid' in m for m in msgs)
     assert len(msgs) >= 9
+
+
+def test_check_2(api_copy, mocker, caplog):
+    mocker.patch('pyglottolog.iso.check_lang', lambda _, i, l, **kw: ('warn', l, 'xyz'))
+    commands.check(_args(api_copy, 'tree'))
+    for record in caplog.records:
+        print(record.message)
 
 
 def test_monster(capsys, api_copy):

@@ -16,7 +16,8 @@ from six.moves import map
 import sqlalchemy as sa
 import sqlalchemy.orm
 import sqlalchemy.ext.declarative  # noqa: F401
-from clldutils import path, dsv, jsonlib
+from clldutils import path, jsonlib
+from csvw import dsv
 
 from . import bibtex
 from ..util import unique, group_first
@@ -34,7 +35,7 @@ class Database(object):
     """Bibfile collection parsed into an sqlite3 database."""
 
     @classmethod
-    def from_bibfiles(cls, bibfiles, filepath, rebuild=False, page_size=32768):
+    def from_bibfiles(cls, bibfiles, filepath, rebuild=False, page_size=32768, verbose=False):
         """If needed, (re)build the db from the bibfiles, hash, split/merge."""
         self = cls(filepath)
 
@@ -66,7 +67,7 @@ class Database(object):
             Entry.hashidstats(conn)
 
             with conn.begin():
-                assign_ids(conn)
+                assign_ids(conn, verbose=verbose)
 
         return self
 

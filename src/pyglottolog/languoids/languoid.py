@@ -3,7 +3,6 @@
 from __future__ import unicode_literals
 
 import os
-from collections import defaultdict
 import functools
 
 from clldutils.misc import UnicodeMixin
@@ -12,9 +11,8 @@ from clldutils.inifile import INI
 from newick import Node
 
 from .models import (
-    Glottocode, Level, Country, Macroarea, Reference,
-    EndangermentStatus, ClassificationComment,
-    EthnologueComment, ISORetirement,
+    Glottocode, Country, Reference, Endangerment, Link,
+    ClassificationComment, EthnologueComment, ISORetirement,
 )
 
 __all__ = ['Languoid']
@@ -30,23 +28,26 @@ class Languoid(UnicodeMixin):
     """
     section_core = 'core'
 
-    def __init__(self, cfg, lineage=None, id_=None, directory=None, tree=None):
+    def __init__(self, cfg, lineage=None, id_=None, directory=None, tree=None, _api=None):
         """
 
         :param cfg:
         :param lineage: list of ancestors, given as (id, name) pairs.
+        :param _api: Some properties require access to config data which is accessed through a \
+        `Glottolog` API instance.
         """
         assert (id_ and tree) or directory
         if id_ is None:
             id_ = Glottocode(directory.name)
         lineage = lineage or []
-        assert all([
-            Glottocode.pattern.match(id) and
-            Level.get(level) for name, id, level in lineage])
-        self.lineage = [(name, id, Level.get(level)) for name, id, level in lineage]
+        assert all(Glottocode.pattern.match(id) for _, id, _ in lineage)
+        self.lineage = [
+            (name, id, _api.languoid_levels.get(level) if _api else level)
+            for name, id, level in lineage]
         self.cfg = cfg
         self.dir = directory or tree.joinpath(*[id for name, id, _ in self.lineage])
         self._id = id_
+        self._api = _api
 
     @classmethod
     def from_dir(cls, directory, nodes=None, **kw):
@@ -63,11 +64,11 @@ class Languoid(UnicodeMixin):
                 break
 
             if id_ not in nodes:
-                l_ = Languoid.from_dir(parent, nodes=nodes)
+                l_ = Languoid.from_dir(parent, nodes=nodes, **kw)
                 nodes[id_] = (l_.name, l_.id, l_.level)
             lineage.append(nodes[id_])
 
-        res = cls(cfg, list(reversed(lineage)), directory=directory)
+        res = cls(cfg, list(reversed(lineage)), directory=directory, **kw)
         nodes[res.id] = (res.name, res.id, res.level)
         return res
 
@@ -76,18 +77,22 @@ class Languoid(UnicodeMixin):
         cfg = INI(interpolation=None)
         cfg.read_dict(dict(core=dict(name=name)))
         res = cls(cfg, kw.pop('lineage', []), id_=Glottocode(id), tree=tree)
-        res.level = Level.get(level)
         for k, v in kw.items():
             setattr(res, k, v)
+        # Note: Setting the level behaves differently when `_api` is available, so must be done
+        # after all other attributes are initialized.
+        res.level = level
         return res
 
+    # We provide a couple of node label format specifications which can be used when serializing
+    # trees in newick format.
     _format_specs = {
         'newick_name': (
             lambda l: l.name.replace(
                 ',', '/').replace('(', '{').replace(')', '}').replace("'", "''"),
             "Languoid name with special newick characters replaced"),
         'newick_level': (
-            lambda l: '-l-' if l.level == Level.language else '',
+            lambda l: '-l-' if getattr(l.level, 'id', l.level) == 'language' else '',
             "Languoid level in case of languages"),
         'newick_iso': (
             lambda l: '[{0}]'.format(l.iso) if l.iso else '',
@@ -113,7 +118,7 @@ class Languoid(UnicodeMixin):
         return self.id < other.id
 
     def __repr__(self):
-        return '<%s %s>' % (self.level.name.capitalize(), self.id)
+        return '<%s %s>' % (getattr(self.level, 'name', self.level).capitalize(), self.id)
 
     def __unicode__(self):
         return '%s [%s]' % (self.name, self.id)
@@ -133,7 +138,7 @@ class Languoid(UnicodeMixin):
 
     def newick_node(self, nodes=None, template=None):
         template = template or self._newick_default_template
-        n = Node(name=template.format(l=self), length='1')
+        n = Node(name=template.format(l=self), length='1')  # noqa: E741
         children = self.children if nodes is None else self.children_from_nodemap(nodes)
         for nn in sorted(children, key=lambda nn: nn.name):
             n.add_descendant(nn.newick_node(nodes=nodes, template=template))
@@ -169,31 +174,23 @@ class Languoid(UnicodeMixin):
 
     @property
     def category(self):
-        fid = self.lineage[0][1] if self.lineage else None
-        category_map = defaultdict(
-            lambda: 'Spoken L1 Language',
-            **{
-                'book1242': 'Bookkeeping',
-                'unat1236': 'Unattested',
-                'uncl1493': 'Unclassifiable',
-                'sign1238': 'Sign Language',
-                'arti1236': 'Artificial Language',
-                'spee1234': 'Speech Register',
-                'pidg1258': 'Pidgin',
-                'mixe1287': 'Mixed Language',
-            })
-        if self.level == Level.language:
-            return category_map[fid]
-        cat = self.level.name.capitalize()
-        if self.level == Level.family:
-            if self.id.startswith('unun9') or \
-                    self.id in category_map or fid in category_map:
-                cat = 'Pseudo ' + cat
-        return cat
+        # Computing the category requires access to config data:
+        if self._api:
+            pseudo_families = {
+                c.pseudo_family_id: c.category for c in self._api.language_types.values()}
+            fid = self.lineage[0][1] if self.lineage else None
+            if self.level == self._api.languoid_levels.language:
+                return pseudo_families.get(fid, self._api.language_types['spoken_l1'].category)
+            cat = self.level.name.capitalize()
+            if self.level == self._api.languoid_levels.family:
+                if self.id.startswith('unun9') or \
+                        self.id in pseudo_families or fid in pseudo_families:
+                    cat = 'Pseudo ' + cat
+            return cat
 
     @property
     def isolate(self):
-        return self.level == Level.language and not self.lineage
+        return getattr(self.level, 'id', self.level) == 'language' and not self.lineage
 
     def children_from_nodemap(self, nodes):
         # A faster alternative to `children` when the relevant languoids have already been
@@ -221,7 +218,7 @@ class Languoid(UnicodeMixin):
         for parent in self.dir.parents:
             id_ = parent.name
             if Glottocode.pattern.match(id_):
-                res.append(Languoid.from_dir(parent))
+                res.append(Languoid.from_dir(parent, _api=self._api))
             else:
                 # we ignore leading non-languoid-dir path components.
                 break
@@ -248,6 +245,13 @@ class Languoid(UnicodeMixin):
         if name not in names:
             self.cfg.set('altnames', type_, sorted(names + [name]))
 
+    def update_names(self, names, type_='glottolog'):
+        new = set(names)
+        if new != set(self.cfg.getlist('altnames', type_)):
+            self.cfg.set('altnames', type_, sorted(new))
+            return True
+        return False
+
     @property
     def identifier(self):
         if 'identifier' in self.cfg:
@@ -267,14 +271,11 @@ class Languoid(UnicodeMixin):
 
     @property
     def endangerment(self):
-        if 'endangerment' in self.cfg:
-            res = self.cfg.get('endangerment', 'status')
-            if res:
-                return EndangermentStatus.get(res)
-
-    @endangerment.setter
-    def endangerment(self, value):
-        self._set('status', EndangermentStatus.get(value).name, section='endangerment')
+        if ('endangerment' in self.cfg) and self._api:
+            kw = {k: v for k, v in self.cfg['endangerment'].items()}
+            kw['status'] = self._api.aes_status.get(kw['status'])
+            kw['source'] = self._api.aes_sources[kw['source']]
+            return Endangerment(**kw)
 
     @property
     def classification_comment(self):
@@ -294,14 +295,34 @@ class Languoid(UnicodeMixin):
 
     @property
     def macroareas(self):
-        return [Macroarea.get(n)
+        if self._api:
+            return [
+                self._api.macroareas.get(n)
                 for n in self.cfg.getlist(self.section_core, 'macroareas')]
+        return []
 
     @macroareas.setter
     def macroareas(self, value):
-        assert isinstance(value, (list, tuple)) \
-            and all(o in list(Macroarea) for o in value)
-        self._set('macroareas', ['{0}'.format(ma) for ma in value])
+        if self._api:
+            assert isinstance(value, (list, tuple)) \
+                and all(self._api.macroareas.get(n) for n in value)
+            self._set('macroareas', [ma.name for ma in value])
+
+    @property
+    def links(self):
+        return [Link.from_string(s) for s in self.cfg.getlist(self.section_core, 'links')]
+
+    @links.setter
+    def links(self, value):
+        assert isinstance(value, list)
+        self._set('links', [v.to_string() for v in sorted(Link.from_(v) for v in value)])
+
+    def update_links(self, domain, urls):
+        new = [li for li in self.links if li.domain != domain] + [Link.from_(u) for u in urls]
+        if set(new) != set(self.links):
+            self.links = new
+            return True
+        return False
 
     @property
     def countries(self):
@@ -348,11 +369,14 @@ class Languoid(UnicodeMixin):
 
     @property
     def level(self):
-        return self._get('level', Level.get)
+        if self._api:
+            return self._get('level', self._api.languoid_levels.get)
+        return self._get('level', lambda s: s)
 
     @level.setter
     def level(self, value):
-        self._set('level', Level.get(value).name)
+        if self._api:
+            self._set('level', self._api.languoid_levels.get(value).id)
 
     @property
     def iso(self):
